@@ -8,7 +8,7 @@ export default function Jobs() {
   const [jobs, setJobs] = useState([])
 
   useEffect(() => {
-    apiFetch(`http://localhost:3001/api/jobs/${user.businessId}`)
+    apiFetch(`/api/jobs/${user.businessId}`)
       .then((response) => response.json())
       .then((data) => setJobs(data))
       .catch((error) => console.error(error))

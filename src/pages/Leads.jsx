@@ -8,7 +8,7 @@ export default function Leads() {
   const [leads, setLeads] = useState([])
 
   useEffect(() => {
-    apiFetch(`http://localhost:3001/api/leads/${user.businessId}`)
+    apiFetch(`/api/leads/${user.businessId}`)
       .then((response) => response.json())
       .then((data) => setLeads(data))
       .catch((error) => console.error(error))

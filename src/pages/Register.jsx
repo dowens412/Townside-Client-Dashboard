@@ -57,7 +57,7 @@ export default function Register() {
 
     try {
       const response = await apiFetch(
-        'http://localhost:3001/api/register',
+        '/api/register',
         {
           method: 'POST',
           headers: {

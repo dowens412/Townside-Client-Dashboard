@@ -45,7 +45,7 @@ export default function Account() {
 
     try {
       const response = await apiFetch(
-        'http://localhost:3001/api/change-password',
+        '/api/change-password',
         {
           method: 'POST',
           headers: {

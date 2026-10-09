@@ -56,7 +56,7 @@ export default function Search() {
 
     try {
       const response = await apiFetch(
-        `http://localhost:3001/api/search/${user.businessId}?q=${encodeURIComponent(value)}`
+        `/api/search/${user.businessId}?q=${encodeURIComponent(value)}`
       )
 
       const data = await response.json()
@@ -155,8 +155,8 @@ export default function Search() {
     setMessage('')
 
     const url = editingId
-      ? `http://localhost:3001/api/records/${form.recordType}/${editingId}`
-      : `http://localhost:3001/api/records/${form.recordType}`
+      ? `/api/records/${form.recordType}/${editingId}`
+      : `/api/records/${form.recordType}`
 
     const method = editingId ? 'PUT' : 'POST'
 
@@ -207,7 +207,7 @@ export default function Search() {
 
     try {
       const response = await apiFetch(
-        `http://localhost:3001/api/records/${record.recordType}/${record.id}?businessId=${user.businessId}`,
+        `/api/records/${record.recordType}/${record.id}?businessId=${user.businessId}`,
         {
           method: 'DELETE'
         }

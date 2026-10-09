@@ -1,4 +1,6 @@
 import process from 'node:process'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import express from 'express'
 import cors from 'cors'
@@ -16,6 +18,10 @@ const { Pool } = pg
 const PORT = Number(process.env.PORT || 3001)
 const JWT_SECRET = process.env.JWT_SECRET
 const DATABASE_URL = process.env.DATABASE_URL
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const CLIENT_DIST = path.resolve(__dirname, '..', 'dist')
 
 if (!JWT_SECRET) {
   throw new Error(
@@ -1178,6 +1184,59 @@ app.get('/api/customers/:businessId', requireAuth, async (req, res) => {
       message: 'Unable to load customers.'
     })
   }
+})
+
+
+/* =========================================================
+   OAUTH CALLBACK
+   The actual token exchange is added after the OAuth
+   credentials are generated in the marketplace.
+   ========================================================= */
+
+app.get('/api/oauth/callback', (req, res) => {
+  res
+    .status(200)
+    .type('html')
+    .send(`
+      <!doctype html>
+      <html lang="en">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Townside CRM</title>
+        </head>
+        <body style="font-family:Arial,sans-serif;padding:40px;">
+          <h1>Townside CRM</h1>
+          <p>The connection endpoint is online.</p>
+        </body>
+      </html>
+    `)
+})
+
+/* =========================================================
+   PRODUCTION FRONTEND
+   Express serves the compiled React application.
+   ========================================================= */
+
+app.use(
+  express.static(CLIENT_DIST, {
+    index: false
+  })
+)
+
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    return next()
+  }
+
+  res.sendFile(
+    path.join(CLIENT_DIST, 'index.html'),
+    (error) => {
+      if (error) {
+        next(error)
+      }
+    }
+  )
 })
 
 /* =========================================================

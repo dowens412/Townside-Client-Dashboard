@@ -8,7 +8,7 @@ export default function Customers() {
   const [customers, setCustomers] = useState([])
 
   useEffect(() => {
-    apiFetch(`http://localhost:3001/api/customers/${user.businessId}`)
+    apiFetch(`/api/customers/${user.businessId}`)
       .then((response) => response.json())
       .then((data) => setCustomers(data))
       .catch((error) => console.error(error))

@@ -1,40 +1,49 @@
 import process from 'node:process'
+
 import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
 import rateLimit from 'express-rate-limit'
 import jwt from 'jsonwebtoken'
 import dotenv from 'dotenv'
-import Database from 'better-sqlite3'
 import bcrypt from 'bcryptjs'
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
+import pg from 'pg'
 
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
+dotenv.config()
 
-dotenv.config({
-  path: path.join(__dirname, '..', '.env')
-})
+const { Pool } = pg
 
+const PORT = Number(process.env.PORT || 3001)
 const JWT_SECRET = process.env.JWT_SECRET
+const DATABASE_URL = process.env.DATABASE_URL
 
 if (!JWT_SECRET) {
   throw new Error(
-    'JWT_SECRET is missing. Create a .env file before starting the server.'
+    'JWT_SECRET is missing. Add it to the .env file before starting the server.'
   )
 }
 
+if (!DATABASE_URL) {
+  throw new Error(
+    'DATABASE_URL is missing. Add the Supabase connection string to .env.'
+  )
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  },
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
+})
+
 const app = express()
-const PORT = 3001
 
 app.disable('x-powered-by')
-
-// Week 5 security: add standard HTTP security headers.
 app.use(helmet())
 
-// Only allow requests from the approved frontend.
 const allowedOrigins = [
   process.env.CLIENT_ORIGIN || 'http://localhost:5173',
   'http://127.0.0.1:5173'
@@ -52,10 +61,8 @@ app.use(
   })
 )
 
-// Limit request size so unexpectedly large payloads are rejected.
 app.use(express.json({ limit: '50kb' }))
 
-// General protection against excessive API requests.
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 300,
@@ -63,9 +70,6 @@ const apiLimiter = rateLimit({
   legacyHeaders: false
 })
 
-app.use('/api', apiLimiter)
-
-// Login and registration receive a much stricter limit.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
@@ -76,19 +80,8 @@ const authLimiter = rateLimit({
   }
 })
 
-// Open the SQLite database and enforce foreign-key relationships.
-const db = new Database(path.join(__dirname, 'townside.db'))
-db.pragma('foreign_keys = ON')
+app.use('/api', apiLimiter)
 
-// Load the project database schema without deleting existing data.
-const schema = fs.readFileSync(
-  path.join(__dirname, 'database-schema.sql'),
-  'utf8'
-)
-
-db.exec(schema)
-
-// Create a signed login token that cannot be modified by the browser.
 function issueToken(user) {
   return jwt.sign(
     {
@@ -103,9 +96,7 @@ function issueToken(user) {
   )
 }
 
-// Protect private API routes and load the user's business directly
-// from the database instead of trusting information sent by the browser.
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const authorization = req.get('authorization') || ''
   const [scheme, token] = authorization.split(' ')
 
@@ -118,24 +109,31 @@ function requireAuth(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET)
 
-    const user = db.prepare(`
-      SELECT
-        id,
-        business_id,
-        role
-      FROM users
-      WHERE id = ?
-    `).get(Number(payload.userId))
+    const result = await pool.query(
+      `
+        SELECT
+          id,
+          business_id,
+          role,
+          is_active
+        FROM public.users
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [Number(payload.userId)]
+    )
 
-    if (!user) {
+    const user = result.rows[0]
+
+    if (!user || !user.is_active) {
       return res.status(401).json({
         message: 'Authentication is no longer valid.'
       })
     }
 
     req.auth = {
-      userId: user.id,
-      businessId: user.business_id,
+      userId: Number(user.id),
+      businessId: Number(user.business_id),
       role: user.role
     }
 
@@ -147,7 +145,6 @@ function requireAuth(req, res, next) {
   }
 }
 
-// Password rules used by registration and password changes.
 function passwordIsValid(password) {
   return (
     typeof password === 'string' &&
@@ -159,872 +156,1073 @@ function passwordIsValid(password) {
   )
 }
 
-// Create the original Phase 1 demo data only if the database is empty.
-const existingBusiness = db
-  .prepare('SELECT COUNT(*) AS count FROM businesses')
-  .get().count
+function makeSlug(value) {
+  const base = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
 
-if (existingBusiness === 0) {
-  const result = db
-    .prepare('INSERT INTO businesses (name) VALUES (?)')
-    .run('Demo Service Company')
-
-  const businessId = result.lastInsertRowid
-  const passwordHash = bcrypt.hashSync('Townside123!', 10)
-
-  db.prepare(`
-    INSERT INTO users
-    (business_id, name, email, password_hash, role)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(
-    businessId,
-    'Demo Client',
-    'demo@townsidewebs.com',
-    passwordHash,
-    'admin'
-  )
-
-  const lead = db.prepare(`
-    INSERT INTO leads
-    (
-      business_id,
-      customer_name,
-      phone,
-      email,
-      service,
-      status,
-      estimated_value,
-      notes
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `)
-
-  lead.run(
-    businessId,
-    'John Smith',
-    '(704) 555-0142',
-    'john@example.com',
-    'House Washing',
-    'New Lead',
-    425,
-    'Requested an estimate.'
-  )
-
-  lead.run(
-    businessId,
-    'Sarah Johnson',
-    '(980) 555-0188',
-    'sarah@example.com',
-    'Driveway Cleaning',
-    'Estimate Sent',
-    300,
-    'Estimate sent yesterday.'
-  )
-
-  lead.run(
-    businessId,
-    'Michael Davis',
-    '(704) 555-0121',
-    'michael@example.com',
-    'Roof Cleaning',
-    'Contacted',
-    750,
-    'Follow up later this week.'
-  )
-
-  // Additional demonstration records give the final project
-  // enough realistic data to show search, filtering, and reporting.
-  lead.run(
-    businessId,
-    'James Carter',
-    '(704) 555-0201',
-    'james@example.com',
-    'Tree Removal',
-    'New Lead',
-    1200,
-    'Customer requested an estimate for one large tree.'
-  )
-
-  lead.run(
-    businessId,
-    'Olivia Martinez',
-    '(980) 555-0202',
-    'olivia@example.com',
-    'Tree Trimming',
-    'Contacted',
-    650,
-    'Needs several trees trimmed away from the house.'
-  )
-
-  lead.run(
-    businessId,
-    'Daniel Brooks',
-    '(704) 555-0203',
-    'daniel@example.com',
-    'Stump Grinding',
-    'Estimate Sent',
-    400,
-    'Estimate sent for two stumps.'
-  )
-
-  lead.run(
-    businessId,
-    'Rachel Green',
-    '(980) 555-0204',
-    'rachel@example.com',
-    'Emergency Tree Service',
-    'New Lead',
-    1800,
-    'Storm damaged tree near driveway.'
-  )
-
-  lead.run(
-    businessId,
-    'Kevin Turner',
-    '(704) 555-0205',
-    'kevin@example.com',
-    'Tree Removal',
-    'Won',
-    1450,
-    'Customer approved the estimate.'
-  )
-
-  lead.run(
-    businessId,
-    'Nicole Harris',
-    '(980) 555-0206',
-    'nicole@example.com',
-    'Tree Trimming',
-    'Estimate Sent',
-    725,
-    'Waiting on customer approval.'
-  )
-
-  lead.run(
-    businessId,
-    'Brian Cooper',
-    '(704) 555-0207',
-    'brian@example.com',
-    'Stump Grinding',
-    'Contacted',
-    325,
-    'Follow up requested later this week.'
-  )
-
-  lead.run(
-    businessId,
-    'Ashley Morgan',
-    '(980) 555-0208',
-    'ashley@example.com',
-    'Tree Removal',
-    'New Lead',
-    2100,
-    'Multiple trees need inspection and removal estimate.'
-  )
-
-  lead.run(
-    businessId,
-    'Eric Thompson',
-    '(704) 555-0209',
-    'eric@example.com',
-    'Tree Trimming',
-    'Lost',
-    550,
-    'Customer decided to wait until later in the year.'
-  )
-
-  const job = db.prepare(`
-    INSERT INTO jobs
-    (
-      business_id,
-      customer_name,
-      service,
-      status,
-      job_value,
-      scheduled_date
-    )
-    VALUES (?, ?, ?, ?, ?, ?)
-  `)
-
-  job.run(
-    businessId,
-    'Amanda Wilson',
-    'House Washing',
-    'Scheduled',
-    550,
-    '2026-09-15'
-  )
-
-  job.run(
-    businessId,
-    'Robert Taylor',
-    'Driveway Cleaning',
-    'Completed',
-    375,
-    '2026-09-10'
-  )
-
-  const customer = db.prepare(`
-    INSERT INTO customers
-    (business_id, name, phone, email)
-    VALUES (?, ?, ?, ?)
-  `)
-
-  customer.run(
-    businessId,
-    'Amanda Wilson',
-    '(704) 555-0167',
-    'amanda@example.com'
-  )
-
-  customer.run(
-    businessId,
-    'Robert Taylor',
-    '(980) 555-0133',
-    'robert@example.com'
-  )
-
-  customer.run(
-    businessId,
-    'Emily Brown',
-    '(704) 555-0194',
-    'emily@example.com'
-  )
+  return base || `business-${Date.now()}`
 }
 
-// Make sure the original demo account is the administrative account
-// required for the Phase 3 submission.
-db.prepare(`
-  UPDATE users
-  SET role = 'admin'
-  WHERE email = ?
-`).run('demo@townsidewebs.com')
+async function createUniqueSlug(client, businessName) {
+  const base = makeSlug(businessName)
+  let slug = base
+  let counter = 2
 
-// Verify login credentials against the hashed password in the database.
-app.post('/api/login', authLimiter, (req, res) => {
-  const { email, password } = req.body
-
-  if (!email || !password) {
-    return res.status(400).json({
-      message: 'Email and password are required.'
-    })
-  }
-
-  const user = db.prepare(`
-    SELECT
-      users.id,
-      users.name,
-      users.email,
-      users.password_hash,
-      users.business_id,
-      users.role,
-      businesses.name AS business_name
-    FROM users
-    JOIN businesses
-      ON businesses.id = users.business_id
-    WHERE users.email = ?
-  `).get(email.trim().toLowerCase())
-
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-    return res.status(401).json({
-      message: 'Invalid email or password.'
-    })
-  }
-
-  const publicUser = {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    businessId: user.business_id,
-    businessName: user.business_name,
-    role: user.role
-  }
-
-  res.json({
-    user: publicUser,
-    token: issueToken(publicUser)
-  })
-})
-
-// Register a new Townside Web business and client user.
-app.post('/api/register', authLimiter, (req, res) => {
-  const {
-    name,
-    businessName,
-    email,
-    password
-  } = req.body
-
-  if (!name || !businessName || !email || !password) {
-    return res.status(400).json({
-      message: 'All registration fields are required.'
-    })
-  }
-
-  if (!passwordIsValid(password)) {
-    return res.status(400).json({
-      message:
-        'Password must be at least 8 characters and include uppercase, lowercase, a number, and a special character.'
-    })
-  }
-
-  const normalizedEmail = email.trim().toLowerCase()
-
-  const existingUser = db
-    .prepare('SELECT id FROM users WHERE email = ?')
-    .get(normalizedEmail)
-
-  if (existingUser) {
-    return res.status(409).json({
-      message: 'An account with that email already exists.'
-    })
-  }
-
-  const createAccount = db.transaction(() => {
-    const business = db
-      .prepare('INSERT INTO businesses (name) VALUES (?)')
-      .run(businessName.trim())
-
-    const businessId = business.lastInsertRowid
-    const passwordHash = bcrypt.hashSync(password, 10)
-
-    const user = db.prepare(`
-      INSERT INTO users
-      (business_id, name, email, password_hash, role)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(
-      businessId,
-      name.trim(),
-      normalizedEmail,
-      passwordHash,
-      'client'
+  while (true) {
+    const existing = await client.query(
+      `
+        SELECT id
+        FROM public.businesses
+        WHERE slug = $1
+        LIMIT 1
+      `,
+      [slug]
     )
 
-    return {
-      id: user.lastInsertRowid,
-      name: name.trim(),
-      email: normalizedEmail,
-      businessId,
-      businessName: businessName.trim(),
-      role: 'client'
+    if (existing.rowCount === 0) {
+      return slug
     }
-  })
 
-  const newUser = createAccount()
+    slug = `${base}-${counter}`
+    counter += 1
+  }
+}
 
-  res.status(201).json({
-    user: newUser,
-    token: issueToken(newUser)
-  })
-})
+async function addActivity({
+  businessId,
+  userId = null,
+  actorType = 'user',
+  entityType,
+  entityId = null,
+  action,
+  description = null,
+  metadata = {}
+}) {
+  try {
+    await pool.query(
+      `
+        INSERT INTO public.activity_log
+        (
+          business_id,
+          user_id,
+          actor_type,
+          entity_type,
+          entity_id,
+          action,
+          description,
+          metadata
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+      `,
+      [
+        businessId,
+        userId,
+        actorType,
+        entityType,
+        entityId,
+        action,
+        description,
+        JSON.stringify(metadata)
+      ]
+    )
+  } catch (error) {
+    console.error('Unable to write activity log:', error.message)
+  }
+}
 
-// Verify the current password before allowing a password change.
-app.post('/api/change-password', requireAuth, (req, res) => {
-  const {
-    currentPassword,
-    newPassword
-  } = req.body
+/* =========================================================
+   HEALTH
+   ========================================================= */
 
-  if (!currentPassword || !newPassword) {
-    return res.status(400).json({
-      message: 'Current and new passwords are required.'
+app.get('/api/health', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        NOW() AS server_time,
+        current_database() AS database_name
+    `)
+
+    res.json({
+      ok: true,
+      database: result.rows[0].database_name,
+      serverTime: result.rows[0].server_time
+    })
+  } catch {
+    res.status(503).json({
+      ok: false,
+      message: 'Database connection is unavailable.'
     })
   }
-
-  if (!passwordIsValid(newPassword)) {
-    return res.status(400).json({
-      message:
-        'New password must be at least 8 characters and include uppercase, lowercase, a number, and a special character.'
-    })
-  }
-
-  const user = db.prepare(`
-    SELECT id, password_hash
-    FROM users
-    WHERE id = ?
-  `).get(req.auth.userId)
-
-  if (!user || !bcrypt.compareSync(currentPassword, user.password_hash)) {
-    return res.status(401).json({
-      message: 'Current password is incorrect.'
-    })
-  }
-
-  db.prepare(`
-    UPDATE users
-    SET password_hash = ?
-    WHERE id = ?
-  `).run(
-    bcrypt.hashSync(newPassword, 10),
-    user.id
-  )
-
-  res.json({
-    message: 'Password changed successfully.'
-  })
-})
-
-// Search across leads, jobs, and customers.
-// "*" represents multiple characters and "?" represents one character.
-app.get('/api/search/:businessId', requireAuth, (req, res) => {
-  // Ignore the browser-supplied business id and trust the signed login.
-  const businessId = req.auth.businessId
-  const query = String(req.query.q || '').trim()
-
-  if (!query) {
-    return res.json([])
-  }
-
-  const containsWildcard =
-    query.includes('*') ||
-    query.includes('?') ||
-    query.includes('%') ||
-    query.includes('_')
-
-  let pattern = query
-    .replace(/\*/g, '%')
-    .replace(/\?/g, '_')
-
-  if (!containsWildcard) {
-    pattern = `%${pattern}%`
-  }
-
-  // Additional fields are returned so Phase 3 can load records
-  // into the edit form directly from the Search page.
-  const leads = db.prepare(`
-    SELECT
-      id,
-      'lead' AS recordType,
-      'Lead' AS type,
-      customer_name AS title,
-      service AS details,
-      status,
-      estimated_value AS value,
-      phone,
-      email,
-      notes,
-      NULL AS scheduledDate
-    FROM leads
-    WHERE business_id = ?
-      AND (
-        customer_name LIKE ?
-        OR phone LIKE ?
-        OR email LIKE ?
-        OR service LIKE ?
-        OR status LIKE ?
-        OR notes LIKE ?
-      )
-  `).all(
-    businessId,
-    pattern,
-    pattern,
-    pattern,
-    pattern,
-    pattern,
-    pattern
-  )
-
-  const jobs = db.prepare(`
-    SELECT
-      id,
-      'job' AS recordType,
-      'Job' AS type,
-      customer_name AS title,
-      service AS details,
-      status,
-      job_value AS value,
-      '' AS phone,
-      '' AS email,
-      '' AS notes,
-      scheduled_date AS scheduledDate
-    FROM jobs
-    WHERE business_id = ?
-      AND (
-        customer_name LIKE ?
-        OR service LIKE ?
-        OR status LIKE ?
-        OR scheduled_date LIKE ?
-      )
-  `).all(
-    businessId,
-    pattern,
-    pattern,
-    pattern,
-    pattern
-  )
-
-  const customers = db.prepare(`
-    SELECT
-      id,
-      'customer' AS recordType,
-      'Customer' AS type,
-      name AS title,
-      COALESCE(email, phone, '') AS details,
-      '' AS status,
-      NULL AS value,
-      phone,
-      email,
-      '' AS notes,
-      NULL AS scheduledDate
-    FROM customers
-    WHERE business_id = ?
-      AND (
-        name LIKE ?
-        OR phone LIKE ?
-        OR email LIKE ?
-      )
-  `).all(
-    businessId,
-    pattern,
-    pattern,
-    pattern
-  )
-
-  res.json([
-    ...leads,
-    ...jobs,
-    ...customers
-  ])
 })
 
 /* =========================================================
-   PHASE 3 CRUD ROUTES
-   Add, edit, and delete records directly from Search.
-   Every operation checks the business_id so one client
-   cannot change another client's records.
+   AUTHENTICATION
    ========================================================= */
 
-// Add a new lead, job, or customer.
-app.post('/api/records/:type', requireAuth, (req, res) => {
-  const type = req.params.type
-  const data = req.body
+app.post('/api/login', authLimiter, async (req, res) => {
+  try {
+    const { email, password } = req.body
 
-  // The authenticated account determines which business owns the record.
-  const businessId = req.auth.businessId
-
-  if (!businessId) {
-    return res.status(400).json({
-      message: 'Business information is required.'
-    })
-  }
-
-  if (type === 'lead') {
-    if (!data.name) {
+    if (!email || !password) {
       return res.status(400).json({
-        message: 'Customer name is required.'
+        message: 'Email and password are required.'
       })
     }
 
-    const result = db.prepare(`
-      INSERT INTO leads
-      (
-        business_id,
-        customer_name,
-        phone,
-        email,
-        service,
-        status,
-        estimated_value,
-        notes
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      businessId,
-      data.name.trim(),
-      data.phone || '',
-      data.email || '',
-      data.service || '',
-      data.status || 'New Lead',
-      Number(data.value) || 0,
-      data.notes || ''
+    const result = await pool.query(
+      `
+        SELECT
+          users.id,
+          users.name,
+          users.email,
+          users.password_hash,
+          users.business_id,
+          users.role,
+          users.is_active,
+          businesses.name AS business_name
+        FROM public.users
+        JOIN public.businesses
+          ON businesses.id = users.business_id
+        WHERE LOWER(users.email) = LOWER($1)
+        LIMIT 1
+      `,
+      [email.trim()]
     )
 
-    return res.status(201).json({
-      id: result.lastInsertRowid,
-      message: 'Lead added successfully.'
-    })
-  }
+    const user = result.rows[0]
 
-  if (type === 'job') {
-    if (!data.name) {
-      return res.status(400).json({
-        message: 'Customer name is required.'
+    if (
+      !user ||
+      !user.is_active ||
+      !bcrypt.compareSync(password, user.password_hash)
+    ) {
+      return res.status(401).json({
+        message: 'Invalid email or password.'
       })
     }
 
-    const result = db.prepare(`
-      INSERT INTO jobs
-      (
-        business_id,
-        customer_name,
-        service,
-        status,
-        job_value,
-        scheduled_date
-      )
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      businessId,
-      data.name.trim(),
-      data.service || '',
-      data.status || 'Scheduled',
-      Number(data.value) || 0,
-      data.scheduledDate || ''
+    await pool.query(
+      `
+        UPDATE public.users
+        SET last_login_at = NOW()
+        WHERE id = $1
+      `,
+      [user.id]
     )
 
-    return res.status(201).json({
-      id: result.lastInsertRowid,
-      message: 'Job added successfully.'
-    })
-  }
-
-  if (type === 'customer') {
-    if (!data.name) {
-      return res.status(400).json({
-        message: 'Customer name is required.'
-      })
+    const publicUser = {
+      id: Number(user.id),
+      name: user.name,
+      email: user.email,
+      businessId: Number(user.business_id),
+      businessName: user.business_name,
+      role: user.role
     }
 
-    const result = db.prepare(`
-      INSERT INTO customers
-      (
-        business_id,
-        name,
-        phone,
-        email
-      )
-      VALUES (?, ?, ?, ?)
-    `).run(
-      businessId,
-      data.name.trim(),
-      data.phone || '',
-      data.email || ''
-    )
-
-    return res.status(201).json({
-      id: result.lastInsertRowid,
-      message: 'Customer added successfully.'
+    res.json({
+      user: publicUser,
+      token: issueToken(publicUser)
+    })
+  } catch (error) {
+    console.error('Login error:', error)
+    res.status(500).json({
+      message: 'Unable to log in.'
     })
   }
-
-  return res.status(400).json({
-    message: 'Invalid record type.'
-  })
 })
 
-// Edit an existing lead, job, or customer.
-app.put('/api/records/:type/:id', requireAuth, (req, res) => {
-  const type = req.params.type
-  const id = Number(req.params.id)
-  const data = req.body
-  const businessId = req.auth.businessId
+app.post('/api/register', authLimiter, async (req, res) => {
+  const client = await pool.connect()
 
-  if (!id || !businessId) {
-    return res.status(400).json({
-      message: 'Invalid record information.'
+  try {
+    const {
+      name,
+      businessName,
+      email,
+      password
+    } = req.body
+
+    if (!name || !businessName || !email || !password) {
+      return res.status(400).json({
+        message: 'All registration fields are required.'
+      })
+    }
+
+    if (!passwordIsValid(password)) {
+      return res.status(400).json({
+        message:
+          'Password must be at least 8 characters and include uppercase, lowercase, a number, and a special character.'
+      })
+    }
+
+    const normalizedEmail = email.trim().toLowerCase()
+
+    const existingUser = await client.query(
+      `
+        SELECT id
+        FROM public.users
+        WHERE LOWER(email) = LOWER($1)
+        LIMIT 1
+      `,
+      [normalizedEmail]
+    )
+
+    if (existingUser.rowCount > 0) {
+      return res.status(409).json({
+        message: 'An account with that email already exists.'
+      })
+    }
+
+    await client.query('BEGIN')
+
+    const slug = await createUniqueSlug(client, businessName)
+
+    const businessResult = await client.query(
+      `
+        INSERT INTO public.businesses
+        (
+          name,
+          slug,
+          status
+        )
+        VALUES ($1, $2, 'active')
+        RETURNING id, name
+      `,
+      [
+        businessName.trim(),
+        slug
+      ]
+    )
+
+    const business = businessResult.rows[0]
+    const passwordHash = bcrypt.hashSync(password, 12)
+
+    const userResult = await client.query(
+      `
+        INSERT INTO public.users
+        (
+          business_id,
+          name,
+          email,
+          password_hash,
+          role,
+          is_active
+        )
+        VALUES ($1, $2, $3, $4, 'owner', TRUE)
+        RETURNING
+          id,
+          business_id,
+          name,
+          email,
+          role
+      `,
+      [
+        business.id,
+        name.trim(),
+        normalizedEmail,
+        passwordHash
+      ]
+    )
+
+    await client.query('COMMIT')
+
+    const user = userResult.rows[0]
+
+    const publicUser = {
+      id: Number(user.id),
+      name: user.name,
+      email: user.email,
+      businessId: Number(user.business_id),
+      businessName: business.name,
+      role: user.role
+    }
+
+    await addActivity({
+      businessId: publicUser.businessId,
+      userId: publicUser.id,
+      entityType: 'business',
+      entityId: publicUser.businessId,
+      action: 'business_registered',
+      description: 'Business account created.'
+    })
+
+    res.status(201).json({
+      user: publicUser,
+      token: issueToken(publicUser)
+    })
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK')
+    } catch {
+      // Ignore rollback failure.
+    }
+
+    console.error('Registration error:', error)
+
+    res.status(500).json({
+      message: 'Unable to create account.'
+    })
+  } finally {
+    client.release()
+  }
+})
+
+app.post('/api/change-password', requireAuth, async (req, res) => {
+  try {
+    const {
+      currentPassword,
+      newPassword
+    } = req.body
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        message: 'Current and new passwords are required.'
+      })
+    }
+
+    if (!passwordIsValid(newPassword)) {
+      return res.status(400).json({
+        message:
+          'New password must be at least 8 characters and include uppercase, lowercase, a number, and a special character.'
+      })
+    }
+
+    const result = await pool.query(
+      `
+        SELECT id, password_hash
+        FROM public.users
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [req.auth.userId]
+    )
+
+    const user = result.rows[0]
+
+    if (
+      !user ||
+      !bcrypt.compareSync(currentPassword, user.password_hash)
+    ) {
+      return res.status(401).json({
+        message: 'Current password is incorrect.'
+      })
+    }
+
+    const newHash = bcrypt.hashSync(newPassword, 12)
+
+    await pool.query(
+      `
+        UPDATE public.users
+        SET password_hash = $1
+        WHERE id = $2
+      `,
+      [
+        newHash,
+        user.id
+      ]
+    )
+
+    await addActivity({
+      businessId: req.auth.businessId,
+      userId: req.auth.userId,
+      entityType: 'user',
+      entityId: req.auth.userId,
+      action: 'password_changed'
+    })
+
+    res.json({
+      message: 'Password changed successfully.'
+    })
+  } catch (error) {
+    console.error('Password change error:', error)
+
+    res.status(500).json({
+      message: 'Unable to change password.'
     })
   }
+})
 
-  let result
+/* =========================================================
+   SEARCH
+   ========================================================= */
 
-  if (type === 'lead') {
-    result = db.prepare(`
-      UPDATE leads
-      SET
-        customer_name = ?,
-        phone = ?,
-        email = ?,
-        service = ?,
-        status = ?,
-        estimated_value = ?,
-        notes = ?
-      WHERE id = ?
-        AND business_id = ?
-    `).run(
-      data.name || '',
-      data.phone || '',
-      data.email || '',
-      data.service || '',
-      data.status || 'New Lead',
-      Number(data.value) || 0,
-      data.notes || '',
-      id,
-      businessId
+app.get('/api/search/:businessId', requireAuth, async (req, res) => {
+  try {
+    const businessId = req.auth.businessId
+    const query = String(req.query.q || '').trim()
+
+    if (!query) {
+      return res.json([])
+    }
+
+    let pattern = query
+      .replace(/\*/g, '%')
+      .replace(/\?/g, '_')
+
+    if (
+      !query.includes('*') &&
+      !query.includes('?') &&
+      !query.includes('%') &&
+      !query.includes('_')
+    ) {
+      pattern = `%${pattern}%`
+    }
+
+    const leadsResult = await pool.query(
+      `
+        SELECT
+          id,
+          'lead' AS "recordType",
+          'Lead' AS type,
+          customer_name AS title,
+          COALESCE(service, '') AS details,
+          status,
+          estimated_value::float8 AS value,
+          COALESCE(phone, '') AS phone,
+          COALESCE(email, '') AS email,
+          COALESCE(notes, '') AS notes,
+          NULL::text AS "scheduledDate"
+        FROM public.leads
+        WHERE business_id = $1
+          AND deleted_at IS NULL
+          AND (
+            customer_name ILIKE $2
+            OR COALESCE(phone, '') ILIKE $2
+            OR COALESCE(email, '') ILIKE $2
+            OR COALESCE(service, '') ILIKE $2
+            OR status ILIKE $2
+            OR COALESCE(notes, '') ILIKE $2
+          )
+        ORDER BY id DESC
+      `,
+      [businessId, pattern]
     )
-  } else if (type === 'job') {
-    result = db.prepare(`
-      UPDATE jobs
-      SET
-        customer_name = ?,
-        service = ?,
-        status = ?,
-        job_value = ?,
-        scheduled_date = ?
-      WHERE id = ?
-        AND business_id = ?
-    `).run(
-      data.name || '',
-      data.service || '',
-      data.status || 'Scheduled',
-      Number(data.value) || 0,
-      data.scheduledDate || '',
-      id,
-      businessId
+
+    const jobsResult = await pool.query(
+      `
+        SELECT
+          id,
+          'job' AS "recordType",
+          'Job' AS type,
+          customer_name AS title,
+          COALESCE(service, '') AS details,
+          status,
+          job_value::float8 AS value,
+          ''::text AS phone,
+          ''::text AS email,
+          COALESCE(notes, '') AS notes,
+          scheduled_date::text AS "scheduledDate"
+        FROM public.jobs
+        WHERE business_id = $1
+          AND deleted_at IS NULL
+          AND (
+            customer_name ILIKE $2
+            OR COALESCE(service, '') ILIKE $2
+            OR status ILIKE $2
+            OR COALESCE(scheduled_date::text, '') ILIKE $2
+          )
+        ORDER BY id DESC
+      `,
+      [businessId, pattern]
     )
-  } else if (type === 'customer') {
-    result = db.prepare(`
-      UPDATE customers
-      SET
-        name = ?,
-        phone = ?,
-        email = ?
-      WHERE id = ?
-        AND business_id = ?
-    `).run(
-      data.name || '',
-      data.phone || '',
-      data.email || '',
-      id,
-      businessId
+
+    const customersResult = await pool.query(
+      `
+        SELECT
+          id,
+          'customer' AS "recordType",
+          'Customer' AS type,
+          name AS title,
+          COALESCE(email, phone, '') AS details,
+          ''::text AS status,
+          NULL::float8 AS value,
+          COALESCE(phone, '') AS phone,
+          COALESCE(email, '') AS email,
+          COALESCE(notes, '') AS notes,
+          NULL::text AS "scheduledDate"
+        FROM public.customers
+        WHERE business_id = $1
+          AND deleted_at IS NULL
+          AND (
+            name ILIKE $2
+            OR COALESCE(phone, '') ILIKE $2
+            OR COALESCE(email, '') ILIKE $2
+          )
+        ORDER BY id DESC
+      `,
+      [businessId, pattern]
     )
-  } else {
-    return res.status(400).json({
+
+    res.json([
+      ...leadsResult.rows,
+      ...jobsResult.rows,
+      ...customersResult.rows
+    ])
+  } catch (error) {
+    console.error('Search error:', error)
+
+    res.status(500).json({
+      message: 'Unable to search records.'
+    })
+  }
+})
+
+/* =========================================================
+   CREATE RECORDS
+   ========================================================= */
+
+app.post('/api/records/:type', requireAuth, async (req, res) => {
+  try {
+    const type = req.params.type
+    const data = req.body
+    const businessId = req.auth.businessId
+
+    if (!data.name?.trim()) {
+      return res.status(400).json({
+        message: 'Customer name is required.'
+      })
+    }
+
+    if (type === 'lead') {
+      const result = await pool.query(
+        `
+          INSERT INTO public.leads
+          (
+            business_id,
+            customer_name,
+            phone,
+            email,
+            service,
+            status,
+            estimated_value,
+            notes
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          RETURNING id
+        `,
+        [
+          businessId,
+          data.name.trim(),
+          data.phone || null,
+          data.email || null,
+          data.service || null,
+          data.status || 'New Lead',
+          Number(data.value) || 0,
+          data.notes || null
+        ]
+      )
+
+      const id = Number(result.rows[0].id)
+
+      await addActivity({
+        businessId,
+        userId: req.auth.userId,
+        entityType: 'lead',
+        entityId: id,
+        action: 'lead_created',
+        description: `Lead created for ${data.name.trim()}.`
+      })
+
+      return res.status(201).json({
+        id,
+        message: 'Lead added successfully.'
+      })
+    }
+
+    if (type === 'job') {
+      const result = await pool.query(
+        `
+          INSERT INTO public.jobs
+          (
+            business_id,
+            customer_name,
+            service,
+            status,
+            job_value,
+            scheduled_date,
+            notes
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          RETURNING id
+        `,
+        [
+          businessId,
+          data.name.trim(),
+          data.service || null,
+          data.status || 'Scheduled',
+          Number(data.value) || 0,
+          data.scheduledDate || null,
+          data.notes || null
+        ]
+      )
+
+      const id = Number(result.rows[0].id)
+
+      await addActivity({
+        businessId,
+        userId: req.auth.userId,
+        entityType: 'job',
+        entityId: id,
+        action: 'job_created',
+        description: `Job created for ${data.name.trim()}.`
+      })
+
+      return res.status(201).json({
+        id,
+        message: 'Job added successfully.'
+      })
+    }
+
+    if (type === 'customer') {
+      const result = await pool.query(
+        `
+          INSERT INTO public.customers
+          (
+            business_id,
+            name,
+            phone,
+            email
+          )
+          VALUES ($1, $2, $3, $4)
+          RETURNING id
+        `,
+        [
+          businessId,
+          data.name.trim(),
+          data.phone || null,
+          data.email || null
+        ]
+      )
+
+      const id = Number(result.rows[0].id)
+
+      await addActivity({
+        businessId,
+        userId: req.auth.userId,
+        entityType: 'customer',
+        entityId: id,
+        action: 'customer_created',
+        description: `Customer created: ${data.name.trim()}.`
+      })
+
+      return res.status(201).json({
+        id,
+        message: 'Customer added successfully.'
+      })
+    }
+
+    res.status(400).json({
       message: 'Invalid record type.'
     })
-  }
+  } catch (error) {
+    console.error('Create record error:', error)
 
-  if (result.changes === 0) {
-    return res.status(404).json({
-      message: 'Record was not found.'
+    res.status(500).json({
+      message: 'Unable to create record.'
     })
   }
+})
 
-  res.json({
-    message: 'Record updated successfully.'
+/* =========================================================
+   UPDATE RECORDS
+   ========================================================= */
+
+app.put('/api/records/:type/:id', requireAuth, async (req, res) => {
+  try {
+    const type = req.params.type
+    const id = Number(req.params.id)
+    const data = req.body
+    const businessId = req.auth.businessId
+
+    if (!id) {
+      return res.status(400).json({
+        message: 'Invalid record information.'
+      })
+    }
+
+    let result
+
+    if (type === 'lead') {
+      result = await pool.query(
+        `
+          UPDATE public.leads
+          SET
+            customer_name = $1,
+            phone = $2,
+            email = $3,
+            service = $4,
+            status = $5,
+            estimated_value = $6,
+            notes = $7
+          WHERE id = $8
+            AND business_id = $9
+            AND deleted_at IS NULL
+          RETURNING id
+        `,
+        [
+          data.name || '',
+          data.phone || null,
+          data.email || null,
+          data.service || null,
+          data.status || 'New Lead',
+          Number(data.value) || 0,
+          data.notes || null,
+          id,
+          businessId
+        ]
+      )
+    } else if (type === 'job') {
+      result = await pool.query(
+        `
+          UPDATE public.jobs
+          SET
+            customer_name = $1,
+            service = $2,
+            status = $3,
+            job_value = $4,
+            scheduled_date = $5,
+            notes = $6
+          WHERE id = $7
+            AND business_id = $8
+            AND deleted_at IS NULL
+          RETURNING id
+        `,
+        [
+          data.name || '',
+          data.service || null,
+          data.status || 'Scheduled',
+          Number(data.value) || 0,
+          data.scheduledDate || null,
+          data.notes || null,
+          id,
+          businessId
+        ]
+      )
+    } else if (type === 'customer') {
+      result = await pool.query(
+        `
+          UPDATE public.customers
+          SET
+            name = $1,
+            phone = $2,
+            email = $3
+          WHERE id = $4
+            AND business_id = $5
+            AND deleted_at IS NULL
+          RETURNING id
+        `,
+        [
+          data.name || '',
+          data.phone || null,
+          data.email || null,
+          id,
+          businessId
+        ]
+      )
+    } else {
+      return res.status(400).json({
+        message: 'Invalid record type.'
+      })
+    }
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        message: 'Record was not found.'
+      })
+    }
+
+    await addActivity({
+      businessId,
+      userId: req.auth.userId,
+      entityType: type,
+      entityId: id,
+      action: `${type}_updated`
+    })
+
+    res.json({
+      message: 'Record updated successfully.'
+    })
+  } catch (error) {
+    console.error('Update record error:', error)
+
+    res.status(500).json({
+      message: 'Unable to update record.'
+    })
+  }
+})
+
+/* =========================================================
+   DELETE RECORDS
+   Soft delete so production data can be recovered.
+   ========================================================= */
+
+app.delete('/api/records/:type/:id', requireAuth, async (req, res) => {
+  try {
+    const type = req.params.type
+    const id = Number(req.params.id)
+    const businessId = req.auth.businessId
+
+    if (!id) {
+      return res.status(400).json({
+        message: 'Invalid record information.'
+      })
+    }
+
+    const tableMap = {
+      lead: 'leads',
+      job: 'jobs',
+      customer: 'customers'
+    }
+
+    const table = tableMap[type]
+
+    if (!table) {
+      return res.status(400).json({
+        message: 'Invalid record type.'
+      })
+    }
+
+    const result = await pool.query(
+      `
+        UPDATE public.${table}
+        SET deleted_at = NOW()
+        WHERE id = $1
+          AND business_id = $2
+          AND deleted_at IS NULL
+        RETURNING id
+      `,
+      [
+        id,
+        businessId
+      ]
+    )
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        message: 'Record was not found.'
+      })
+    }
+
+    await addActivity({
+      businessId,
+      userId: req.auth.userId,
+      entityType: type,
+      entityId: id,
+      action: `${type}_deleted`
+    })
+
+    res.json({
+      message: 'Record deleted successfully.'
+    })
+  } catch (error) {
+    console.error('Delete record error:', error)
+
+    res.status(500).json({
+      message: 'Unable to delete record.'
+    })
+  }
+})
+
+/* =========================================================
+   DASHBOARD
+   ========================================================= */
+
+app.get('/api/dashboard/:businessId', requireAuth, async (req, res) => {
+  try {
+    const businessId = req.auth.businessId
+
+    const result = await pool.query(
+      `
+        SELECT
+          (
+            SELECT COUNT(*)::int
+            FROM public.leads
+            WHERE business_id = $1
+              AND deleted_at IS NULL
+              AND status = 'New Lead'
+          ) AS "newLeads",
+
+          (
+            SELECT COUNT(*)::int
+            FROM public.leads
+            WHERE business_id = $1
+              AND deleted_at IS NULL
+              AND status = 'Estimate Sent'
+          ) AS "openEstimates",
+
+          (
+            SELECT COUNT(*)::int
+            FROM public.jobs
+            WHERE business_id = $1
+              AND deleted_at IS NULL
+          ) AS jobs,
+
+          (
+            SELECT COALESCE(SUM(estimated_value), 0)::float8
+            FROM public.leads
+            WHERE business_id = $1
+              AND deleted_at IS NULL
+              AND status != 'Lost'
+          ) AS "potentialValue"
+      `,
+      [businessId]
+    )
+
+    res.json(result.rows[0])
+  } catch (error) {
+    console.error('Dashboard error:', error)
+
+    res.status(500).json({
+      message: 'Unable to load dashboard.'
+    })
+  }
+})
+
+/* =========================================================
+   LIST PAGES
+   ========================================================= */
+
+app.get('/api/leads/:businessId', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          id,
+          business_id,
+          customer_name,
+          phone,
+          email,
+          service,
+          status,
+          estimated_value::float8 AS estimated_value,
+          notes,
+          created_at
+        FROM public.leads
+        WHERE business_id = $1
+          AND deleted_at IS NULL
+        ORDER BY id DESC
+      `,
+      [req.auth.businessId]
+    )
+
+    res.json(result.rows)
+  } catch (error) {
+    console.error('Leads error:', error)
+
+    res.status(500).json({
+      message: 'Unable to load leads.'
+    })
+  }
+})
+
+app.get('/api/jobs/:businessId', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          id,
+          business_id,
+          customer_name,
+          service,
+          status,
+          job_value::float8 AS job_value,
+          scheduled_date,
+          notes,
+          created_at
+        FROM public.jobs
+        WHERE business_id = $1
+          AND deleted_at IS NULL
+        ORDER BY id DESC
+      `,
+      [req.auth.businessId]
+    )
+
+    res.json(result.rows)
+  } catch (error) {
+    console.error('Jobs error:', error)
+
+    res.status(500).json({
+      message: 'Unable to load jobs.'
+    })
+  }
+})
+
+app.get('/api/customers/:businessId', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          id,
+          business_id,
+          name,
+          phone,
+          email,
+          notes,
+          created_at
+        FROM public.customers
+        WHERE business_id = $1
+          AND deleted_at IS NULL
+        ORDER BY id DESC
+      `,
+      [req.auth.businessId]
+    )
+
+    res.json(result.rows)
+  } catch (error) {
+    console.error('Customers error:', error)
+
+    res.status(500).json({
+      message: 'Unable to load customers.'
+    })
+  }
+})
+
+/* =========================================================
+   ERROR HANDLER
+   ========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error('Unhandled API error:', error)
+
+  if (res.headersSent) {
+    return next(error)
+  }
+
+  res.status(500).json({
+    message: 'An unexpected server error occurred.'
   })
 })
 
-// Delete a record only when it belongs to the logged-in business.
-app.delete('/api/records/:type/:id', requireAuth, (req, res) => {
-  const type = req.params.type
-  const id = Number(req.params.id)
-  const businessId = req.auth.businessId
+async function startServer() {
+  try {
+    const connection = await pool.query(`
+      SELECT NOW() AS connected_at
+    `)
 
-  if (!id || !businessId) {
-    return res.status(400).json({
-      message: 'Invalid record information.'
+    console.log(
+      `PostgreSQL connected at ${connection.rows[0].connected_at.toISOString()}`
+    )
+
+    app.listen(PORT, () => {
+      console.log(`Townside API running at http://localhost:${PORT}`)
     })
+  } catch (error) {
+    console.error('Unable to connect to PostgreSQL.')
+    console.error(error)
+    process.exit(1)
   }
+}
 
-  let result
+async function shutdown() {
+  console.log('\nClosing PostgreSQL connection...')
+  await pool.end()
+  process.exit(0)
+}
 
-  if (type === 'lead') {
-    result = db.prepare(`
-      DELETE FROM leads
-      WHERE id = ?
-        AND business_id = ?
-    `).run(id, businessId)
-  } else if (type === 'job') {
-    result = db.prepare(`
-      DELETE FROM jobs
-      WHERE id = ?
-        AND business_id = ?
-    `).run(id, businessId)
-  } else if (type === 'customer') {
-    result = db.prepare(`
-      DELETE FROM customers
-      WHERE id = ?
-        AND business_id = ?
-    `).run(id, businessId)
-  } else {
-    return res.status(400).json({
-      message: 'Invalid record type.'
-    })
-  }
+process.on('SIGINT', shutdown)
+process.on('SIGTERM', shutdown)
 
-  if (result.changes === 0) {
-    return res.status(404).json({
-      message: 'Record was not found.'
-    })
-  }
-
-  res.json({
-    message: 'Record deleted successfully.'
-  })
-})
-
-// Dashboard summary.
-app.get('/api/dashboard/:businessId', requireAuth, (req, res) => {
-  const businessId = req.auth.businessId
-
-  const newLeads = db.prepare(`
-    SELECT COUNT(*) AS count
-    FROM leads
-    WHERE business_id = ?
-      AND status = 'New Lead'
-  `).get(businessId).count
-
-  const openEstimates = db.prepare(`
-    SELECT COUNT(*) AS count
-    FROM leads
-    WHERE business_id = ?
-      AND status = 'Estimate Sent'
-  `).get(businessId).count
-
-  const jobs = db.prepare(`
-    SELECT COUNT(*) AS count
-    FROM jobs
-    WHERE business_id = ?
-  `).get(businessId).count
-
-  const potentialValue = db.prepare(`
-    SELECT COALESCE(SUM(estimated_value), 0) AS total
-    FROM leads
-    WHERE business_id = ?
-      AND status != 'Lost'
-  `).get(businessId).total
-
-  res.json({
-    newLeads,
-    openEstimates,
-    jobs,
-    potentialValue
-  })
-})
-
-app.get('/api/leads/:businessId', requireAuth, (req, res) => {
-  const data = db.prepare(`
-    SELECT *
-    FROM leads
-    WHERE business_id = ?
-    ORDER BY id DESC
-  `).all(req.auth.businessId)
-
-  res.json(data)
-})
-
-app.get('/api/jobs/:businessId', requireAuth, (req, res) => {
-  const data = db.prepare(`
-    SELECT *
-    FROM jobs
-    WHERE business_id = ?
-    ORDER BY id DESC
-  `).all(req.auth.businessId)
-
-  res.json(data)
-})
-
-app.get('/api/customers/:businessId', requireAuth, (req, res) => {
-  const data = db.prepare(`
-    SELECT *
-    FROM customers
-    WHERE business_id = ?
-    ORDER BY id DESC
-  `).all(req.auth.businessId)
-
-  res.json(data)
-})
-
-app.listen(PORT, () => {
-  console.log(`Townside API running at http://localhost:${PORT}`)
-})
+startServer()
